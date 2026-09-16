@@ -1,0 +1,1 @@
+UPDATE public.app_settings SET origin_lat = -22.8492201, origin_lng = -47.2111382 WHERE id = 1;
