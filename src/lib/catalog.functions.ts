@@ -27,7 +27,6 @@ const PUBLIC_SETTINGS_COLUMNS =
 
 export const getCatalog = createServerFn({ method: "GET" }).handler(async () => {
   const supabase = publicClient();
-  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const [drinks, settings] = await Promise.all([
     supabase
       .from("drinks")
@@ -35,7 +34,10 @@ export const getCatalog = createServerFn({ method: "GET" }).handler(async () => 
       .eq("active", true)
       .order("category")
       .order("sort_order"),
-    supabaseAdmin.from("app_settings").select(PUBLIC_SETTINGS_COLUMNS).eq("id", 1).maybeSingle(),
+    (async () => {
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      return supabaseAdmin.from("app_settings").select(PUBLIC_SETTINGS_COLUMNS).eq("id", 1).maybeSingle();
+    })(),
   ]);
   if (drinks.error) throw drinks.error;
   if (settings.error) throw settings.error;
@@ -70,7 +72,6 @@ async function ufOf(value: string) {
   const { toUf } = await import("./geocode.server");
   return toUf(value);
 }
-
 
 /** Real driving route via OSRM; null when routing is unavailable. */
 async function drivingRoute(
@@ -133,7 +134,6 @@ export const estimateFreight = createServerFn({ method: "POST" })
       .filter(Boolean)
       .join(", ");
 
-    // 1) Estado informado precisa estar entre os estados atendidos.
     const informedUf = await ufOf(data.state);
     if (informedUf && allowed.length > 0 && !allowed.includes(informedUf)) {
       return {
@@ -157,7 +157,6 @@ export const estimateFreight = createServerFn({ method: "POST" })
       };
     }
 
-    // 2) Estado retornado pelo geocoder também precisa estar atendido.
     if (hit.uf && allowed.length > 0 && !allowed.includes(hit.uf)) {
       return {
         ok: false as const,
@@ -172,11 +171,9 @@ export const estimateFreight = createServerFn({ method: "POST" })
 
     const origin: [number, number] = [Number(settings.origin_lat), Number(settings.origin_lng)];
     const route = await drivingRoute(origin, hit.point);
-    // Road routing is the source of truth; straight-line distance is only a fallback estimate.
     const rawKm = route?.km ?? haversineKm(origin, hit.point) * 1.25;
     const distanceKm = Math.round(rawKm * 10) / 10;
 
-    // 3) Distância real da rota deve respeitar o limite configurado.
     if (distanceKm > maxKm) {
       return {
         ok: false as const,
@@ -187,7 +184,6 @@ export const estimateFreight = createServerFn({ method: "POST" })
       };
     }
 
-    // Frete base + km excedentes (mesma fórmula usada no cálculo final do orçamento).
     const { freightForDistance } = await import("@/lib/pricing");
     const freight = freightForDistance(distanceKm, {
       minimum_freight: Number(settings.minimum_freight),
@@ -217,7 +213,6 @@ const QUOTE_STATUS = [
 ] as const;
 
 const quoteSchema = z.object({
-  /** Rascunho existente que deve ser atualizado (id + token conferidos no servidor). */
   quote_id: z.string().uuid().nullable().optional(),
   public_token: z.string().trim().max(60).nullable().optional(),
   status: z.enum(QUOTE_STATUS).default("sent"),
@@ -241,13 +236,6 @@ const quoteSchema = z.object({
   drink_ids: z.array(z.string().uuid()).max(12),
 });
 
-/**
- * Quotes are written only by this trusted server function: the browser sends the
- * request details, and every money field (package price, glass rental, totals and
- * freight) is recomputed here from the database catalog + settings, so clients can
- * never persist arbitrary prices. Drafts reuse the same row through quote_id +
- * public_token, so the client can continue later without losing data.
- */
 export const saveQuote = createServerFn({ method: "POST" })
   .inputValidator((data: unknown) => quoteSchema.parse(data))
   .handler(async ({ data }) => {
@@ -271,7 +259,6 @@ export const saveQuote = createServerFn({ method: "POST" })
     if (!settings) throw new Error("Configuração indisponível.");
 
     const minimumGuests = Number(settings.minimum_guests ?? 0);
-    // Rascunhos podem ficar incompletos; orçamentos enviados respeitam o mínimo.
     if (payload.status !== "draft" && payload.adults + payload.children < minimumGuests) {
       throw new Error(`O orçamento mínimo é para ${minimumGuests} pessoas.`);
     }
@@ -343,196 +330,7 @@ export const saveQuote = createServerFn({ method: "POST" })
       .from("quotes")
       .insert(row as never)
       .select("id, public_token")
-      .maybeSingle();
+      .single();
     if (error) throw error;
-    return {
-      id: inserted?.id ?? null,
-      public_token: (inserted?.public_token as string | undefined) ?? null,
-    };
-  });
-
-/** Agenda de degustação: datas ativas + horários já reservados. */
-export const getTastingAgenda = createServerFn({ method: "GET" }).handler(async () => {
-  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-  const today = new Date().toISOString().slice(0, 10);
-  const now = new Date().toISOString();
-  const [datesRes, bookedRes, settingsRes] = await Promise.all([
-    supabaseAdmin
-      .from("tasting_availability")
-      .select("id, date, start_time, end_time, interval_minutes, blocked_times")
-      .eq("active", true)
-      .gte("date", today)
-      .order("date"),
-    supabaseAdmin
-      .from("tasting_appointments")
-      .select("date, time, status, hold_expires_at")
-      .in("status", ["pending_payment", "scheduled", "confirmed"])
-      .gte("date", today),
-    supabaseAdmin
-      .from("app_settings")
-      .select("tasting_price_per_person, tasting_payment_link, payment_whatsapp_number, whatsapp_number, tasting_address, tasting_number, tasting_complement, tasting_neighborhood, tasting_city, tasting_state, tasting_cep")
-      .eq("id", 1)
-      .maybeSingle(),
-  ]);
-  if (datesRes.error) throw datesRes.error;
-  if (bookedRes.error) throw bookedRes.error;
-  if (settingsRes.error) throw settingsRes.error;
-  const activeBooked = (bookedRes.data ?? []).filter((item) => {
-    const booking = item as { hold_expires_at?: string | null; status?: string };
-    return booking.status !== "pending_payment" || !booking.hold_expires_at || booking.hold_expires_at > now;
-  });
-  return { dates: datesRes.data ?? [], booked: activeBooked, settings: settingsRes.data };
-});
-
-/** Reserva de degustação: valor recalculado no servidor e slot protegido por índice único. */
-export const bookTasting = createServerFn({ method: "POST" })
-  .inputValidator((data: unknown) =>
-    z
-      .object({
-        quote_id: z.string().uuid().nullable(),
-        date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-        time: z.string().regex(/^\d{2}:\d{2}$/),
-        people: z.number().int().min(1).max(50),
-        client_name: z.string().trim().min(2).max(120),
-        client_phone: z.string().trim().min(8).max(30),
-      })
-      .parse(data),
-  )
-  .handler(async ({ data }) => {
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const [settingsRes, dayRes, takenRes] = await Promise.all([
-      supabaseAdmin
-        .from("app_settings")
-        .select("tasting_price_per_person, tasting_payment_link")
-        .eq("id", 1)
-        .maybeSingle(),
-      supabaseAdmin
-        .from("tasting_availability")
-        .select("date, active, start_time, end_time, interval_minutes, blocked_times")
-        .eq("date", data.date)
-        .maybeSingle(),
-      supabaseAdmin
-        .from("tasting_appointments")
-        .select("id, status, hold_expires_at")
-        .eq("date", data.date)
-        .eq("time", data.time)
-        .in("status", ["pending_payment", "scheduled", "confirmed"]),
-    ]);
-    if (settingsRes.error) throw settingsRes.error;
-    if (dayRes.error) throw dayRes.error;
-    if (takenRes.error) throw takenRes.error;
-
-    const day = dayRes.data;
-    if (!day || !day.active) throw new Error("Esta data não está disponível para degustação.");
-    const { buildSlots } = await import("@/lib/quote-state");
-    const slots = buildSlots(
-      String(day.start_time),
-      String(day.end_time),
-      Number(day.interval_minutes),
-    ).filter((slot) => !(day.blocked_times ?? []).includes(slot));
-    if (!slots.includes(data.time)) throw new Error("Este horário não está disponível.");
-    const now = Date.now();
-    const activeTaken = (takenRes.data ?? []).some((item) =>
-      item.status !== "pending_payment" || !item.hold_expires_at || new Date(item.hold_expires_at).getTime() > now,
-    );
-    if (activeTaken) throw new Error("Este horário já foi reservado.");
-    await supabaseAdmin
-      .from("tasting_appointments")
-      .update({ status: "cancelled" })
-      .eq("date", data.date)
-      .eq("time", data.time)
-      .eq("status", "pending_payment")
-      .lt("hold_expires_at", new Date().toISOString());
-
-    const price = Number(settingsRes.data?.tasting_price_per_person ?? 0);
-    const { data: row, error } = await supabaseAdmin
-      .from("tasting_appointments")
-      .insert({
-        quote_id: data.quote_id,
-        date: data.date,
-        time: data.time,
-        people: data.people,
-        price_per_person: price,
-        total: price * data.people,
-        client_name: data.client_name,
-        client_phone: data.client_phone,
-         duration_minutes: 60,
-         status: "pending_payment",
-         payment_status: "pending",
-         hold_expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
-      })
-      .select("id, total, public_token, status, payment_status, hold_expires_at")
-      .maybeSingle();
-    if (error) {
-      if (error.code === "23505" || /duplicate|unique/i.test(error.message)) {
-        throw new Error("Este horário acabou de ser reservado. Escolha outro.");
-      }
-      throw error;
-    }
-    if (data.quote_id) {
-      await supabaseAdmin
-        .from("quotes")
-        .update({ status: "payment_pending" })
-        .eq("id", data.quote_id);
-    }
-    return {
-      id: row?.id ?? null,
-      total: Number(row?.total ?? price * data.people),
-      paymentLink: String(settingsRes.data?.tasting_payment_link ?? ""),
-      publicToken: row?.public_token ?? null,
-      status: row?.status ?? "pending_payment",
-      paymentStatus: row?.payment_status ?? "pending",
-      holdExpiresAt: row?.hold_expires_at ?? null,
-    };
-  });
-
-export const getPublicTasting = createServerFn({ method: "GET" })
-  .inputValidator((data: unknown) => z.object({ token: z.string().trim().min(12).max(80) }).parse(data))
-  .handler(async ({ data }) => {
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const [appointment, settings] = await Promise.all([
-      supabaseAdmin.from("tasting_appointments").select("date, time, duration_minutes, people, price_per_person, total, status, payment_status").eq("public_token", data.token).maybeSingle(),
-      supabaseAdmin.from("app_settings").select("tasting_address, tasting_number, tasting_complement, tasting_neighborhood, tasting_city, tasting_state, tasting_cep").eq("id", 1).maybeSingle(),
-    ]);
-    if (appointment.error) throw appointment.error;
-    if (settings.error) throw settings.error;
-    if (!appointment.data) return null;
-    return { ...appointment.data, address: appointment.data.status === "confirmed" ? settings.data : null };
-  });
-
-/** Orçamento público por token — somente leitura, sem dados administrativos. */
-export const getPublicQuote = createServerFn({ method: "GET" })
-  .inputValidator((data: unknown) =>
-    z.object({ token: z.string().trim().min(6).max(60) }).parse(data),
-  )
-  .handler(async ({ data }) => {
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: quote, error } = await supabaseAdmin
-      .from("quotes")
-      .select(
-        "id, created_at, status, client_name, client_cpf, event_type, honoree_names, event_date, buffet_time, bar_time, dj_time, address, address_number, address_complement, city, state, cep, distance_km, adults, children, drink_names, price_per_person, glass_rental, adults_total, children_total, freight, total",
-      )
-      .eq("public_token", data.token)
-      .maybeSingle();
-    if (error) throw error;
-    if (!quote) return null;
-
-    const tasting = await supabaseAdmin
-      .from("tasting_appointments")
-      .select("date, time, people, price_per_person, total, status, payment_status, duration_minutes")
-      .eq("quote_id", quote.id)
-      .neq("status", "cancelled")
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    const digits = String(quote.client_cpf ?? "").replace(/\D/g, "");
-    const maskedCpf = digits.length === 11 ? `***.***.${digits.slice(6, 9)}-${digits.slice(9)}` : "";
-    const { id: _id, client_cpf: _cpf, ...safe } = quote;
-    const settings = await supabaseAdmin
-      .from("app_settings")
-      .select("tasting_address, tasting_number, tasting_complement, tasting_neighborhood, tasting_city, tasting_state, tasting_cep")
-      .eq("id", 1)
-      .maybeSingle();
-    return { quote: { ...safe, client_cpf_masked: maskedCpf }, tasting: tasting.data ?? null, tastingAddress: settings.data };
+    return { id: inserted.id, public_token: inserted.public_token as string };
   });
