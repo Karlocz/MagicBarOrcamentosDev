@@ -212,7 +212,6 @@ export const updateSettings = createServerFn({ method: "POST" })
     const { supabase } = context;
     await assertAdmin(context as Ctx);
 
-    // Geocodifica o ponto de saída para manter a origem das rotas sempre correta.
     const patch: Record<string, unknown> = { ...data, origin_state: data.origin_state.toUpperCase(), tasting_state: data.tasting_state.toUpperCase(), tasting_interval_minutes: 60 };
     const { geocodeAddress } = await import("./geocode.server");
     const hit = await geocodeAddress({
@@ -357,6 +356,51 @@ export const updateAppointment = createServerFn({ method: "POST" })
     const { id, ...patch } = data;
     if (Object.keys(patch).length === 0) return { ok: true };
     const { error } = await supabase.from("tasting_appointments").update(patch).eq("id", id);
+    if (error) throw error;
+    if (patch.status === "cancelled") {
+      await supabase.from("tasting_appointments").update({ hold_expires_at: null }).eq("id", id);
+    }
+    return { ok: true };
+  });
+
+export const archiveQuote = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: unknown) => z.object({ id: z.string().uuid(), archived: z.boolean() }).parse(data))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context as Ctx);
+    const { error } = await context.supabase
+      .from("quotes")
+      .update({ archived_at: data.archived ? new Date().toISOString() : null })
+      .eq("id", data.id);
+    if (error) throw error;
+    return { ok: true };
+  });
+
+export const updateQuoteStatus = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: unknown) =>
+    z
+      .object({
+        id: z.string().uuid(),
+        status: z.enum([
+          "draft",
+          "sent",
+          "tasting_scheduled",
+          "payment_pending",
+          "tasting_confirmed",
+          "contracted",
+          "cancelled",
+        ]),
+      })
+      .parse(data),
+  )
+  .handler(async ({ data, context }) => {
+    const { supabase } = context;
+    await assertAdmin(context as Ctx);
+    const { error } = await supabase
+      .from("quotes")
+      .update({ status: data.status })
+      .eq("id", data.id);
     if (error) throw error;
     return { ok: true };
   });
