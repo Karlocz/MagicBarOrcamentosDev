@@ -230,7 +230,6 @@ export const updateSettings = createServerFn({ method: "POST" })
     patch["origin_lat"] = hit.point[0];
     patch["origin_lng"] = hit.point[1];
 
-
     const { error } = await supabase.from("app_settings").update(patch as never).eq("id", 1);
     if (error) throw error;
     return { ok: true };
@@ -251,6 +250,50 @@ export const toggleDrink = createServerFn({ method: "POST" })
     if (error) throw error;
     return { ok: true };
   });
+
+export const reorderDrinks = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((data: unknown) =>
+    z.object({
+      category: z.string().min(1).max(40),
+      drink_ids: z.array(z.string().uuid()).min(1).max(200),
+    }).parse(data),
+  )
+  .handler(async ({ data, context }) => {
+    const { supabase } = context;
+    await assertAdmin(context as Ctx);
+
+    const { data: existing, error: readError } = await supabase
+      .from("drinks")
+      .select("id")
+      .eq("category", data.category);
+    if (readError) throw readError;
+
+    const existingIds = new Set((existing ?? []).map((row: { id: string }) => row.id));
+    const orderedIds = data.drink_ids.filter((id) => existingIds.has(id));
+    if (orderedIds.length !== (existing ?? []).length) {
+      throw new Error("A ordenação enviada não corresponde aos drinks desta categoria.");
+    }
+
+    const firstPass = await Promise.all(
+      orderedIds.map((id, index) =>
+        supabase.from("drinks").update({ sort_order: 10000 + index }).eq("id", id),
+      ),
+    );
+    const firstError = firstPass.find((result: { error: unknown }) => result.error)?.error;
+    if (firstError) throw firstError;
+
+    const finalPass = await Promise.all(
+      orderedIds.map((id, index) =>
+        supabase.from("drinks").update({ sort_order: index }).eq("id", id),
+      ),
+    );
+    const finalError = finalPass.find((result: { error: unknown }) => result.error)?.error;
+    if (finalError) throw finalError;
+
+    return { ok: true };
+  });
+
 /** Agenda de degustação: datas administráveis (nada de datas fixas no código). */
 export const upsertTastingDate = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
@@ -303,14 +346,8 @@ export const updateAppointment = createServerFn({ method: "POST" })
         id: z.string().uuid(),
         status: z.enum(["pending_payment", "scheduled", "confirmed", "completed", "cancelled", "no_show"]).optional(),
         payment_status: z.enum(["pending", "paid", "refunded"]).optional(),
-        date: z
-          .string()
-          .regex(/^\d{4}-\d{2}-\d{2}$/)
-          .optional(),
-        time: z
-          .string()
-          .regex(/^\d{2}:\d{2}$/)
-          .optional(),
+        date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        time: z.string().regex(/^\d{2}:\d{2}$/).optional(),
       })
       .parse(data),
   )
@@ -319,55 +356,7 @@ export const updateAppointment = createServerFn({ method: "POST" })
     await assertAdmin(context as Ctx);
     const { id, ...patch } = data;
     if (Object.keys(patch).length === 0) return { ok: true };
-    const { error } = await supabase
-      .from("tasting_appointments")
-      .update(patch as never)
-      .eq("id", id);
-    if (error) throw error;
-    if (patch.status === "cancelled") {
-      await supabase.from("tasting_appointments").update({ hold_expires_at: null }).eq("id", id);
-    }
-    return { ok: true };
-  });
-
-export const archiveQuote = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((data: unknown) => z.object({ id: z.string().uuid(), archived: z.boolean() }).parse(data))
-  .handler(async ({ data, context }) => {
-    await assertAdmin(context as Ctx);
-    const { error } = await context.supabase
-      .from("quotes")
-      .update({ archived_at: data.archived ? new Date().toISOString() : null })
-      .eq("id", data.id);
-    if (error) throw error;
-    return { ok: true };
-  });
-
-export const updateQuoteStatus = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((data: unknown) =>
-    z
-      .object({
-        id: z.string().uuid(),
-        status: z.enum([
-          "draft",
-          "sent",
-          "tasting_scheduled",
-          "payment_pending",
-          "tasting_confirmed",
-          "contracted",
-          "cancelled",
-        ]),
-      })
-      .parse(data),
-  )
-  .handler(async ({ data, context }) => {
-    const { supabase } = context;
-    await assertAdmin(context as Ctx);
-    const { error } = await supabase
-      .from("quotes")
-      .update({ status: data.status })
-      .eq("id", data.id);
+    const { error } = await supabase.from("tasting_appointments").update(patch).eq("id", id);
     if (error) throw error;
     return { ok: true };
   });
